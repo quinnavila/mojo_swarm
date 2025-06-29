@@ -16,6 +16,7 @@ alias CELL_SIZE: Float32 = 50.0
 alias GRID_COLS = Int(floor(WORLD_WIDTH / CELL_SIZE))
 alias GRID_ROWS = Int(floor(WORLD_HEIGHT / CELL_SIZE))
 alias NUM_CELLS = GRID_COLS * GRID_ROWS
+alias PADDED_NUM_CELLS = 256
 
 alias dtype = DType.float32
 alias agents_layout = Layout.row_major(N, 4)
@@ -43,8 +44,8 @@ fn spatial_hash_kernel[
     var cell_y = Int(floor(py / CELL_SIZE))
     var hash = cell_y * GRID_COLS + cell_x
     
-    particle_hashes.store[1](i, 0, SIMD[DType.int32, 1](hash))
-    particle_indices.store[1](i, 0, SIMD[DType.int32, 1](i))
+    particle_hashes[i] = hash
+    particle_indices[i] = i
 
 fn histogram_kernel[
     hash_layout: Layout,
@@ -67,35 +68,39 @@ fn parallel_prefix_sum_kernel[
     cell_counts: LayoutTensor[mut=False, DType.int32, histogram_layout],
     cell_offsets: LayoutTensor[mut=True, DType.int32, cell_offsets_layout],
 ):
-    var shared_data = tb[DType.int32]().row_major[NUM_CELLS]().shared().alloc()
+    var shared_data = tb[DType.int32]().row_major[PADDED_NUM_CELLS]().shared().alloc()
     var i = thread_idx.x
 
     if i < NUM_CELLS:
-        shared_data[i] = cell_counts[i][0]
+        shared_data[i] = cell_counts[i]
+    elif i < PADDED_NUM_CELLS:
+        shared_data[i] = 0
     barrier()
 
-    var log2_num_cells = Int(log2(Float64(NUM_CELLS)))
-
-    for d in range(log2_num_cells):
+    var log2_padded = Int(log2(Float64(PADDED_NUM_CELLS)))
+    
+    for d in range(log2_padded):
+        var offset = 1 << d
         var stride = 1 << (d + 1)
         if (i + 1) % stride == 0:
-            shared_data[i] += shared_data[i - (stride // 2)]
+            shared_data[i] += shared_data[i - offset]
         barrier()
 
-    if i == NUM_CELLS - 1:
-        shared_data[NUM_CELLS - 1] = 0
+    if i == PADDED_NUM_CELLS - 1:
+        shared_data[i] = 0
     barrier()
 
-    for d in range(log2_num_cells - 1, -1, -1):
+    for d in range(log2_padded - 1, -1, -1):
+        var offset = 1 << d
         var stride = 1 << (d + 1)
         if (i + 1) % stride == 0:
-            var temp = shared_data[i - (stride // 2)]
-            shared_data[i - (stride // 2)] = shared_data[i]
+            var temp = shared_data[i - offset]
+            shared_data[i - offset] = shared_data[i]
             shared_data[i] += temp
         barrier()
 
     if i < NUM_CELLS:
-        cell_offsets.store[1](i, 0, SIMD[DType.int32, 1](shared_data[i][0]))
+        cell_offsets[i] = shared_data[i]
 
 def main():
     with DeviceContext() as ctx:
@@ -106,11 +111,10 @@ def main():
         histogram_buffer = ctx.enqueue_create_buffer[DType.int32](histogram_layout.size())
         cell_offsets_buffer = ctx.enqueue_create_buffer[DType.int32](cell_offsets_layout.size())
         
-        ctx.enqueue_memset(histogram_buffer, SIMD[DType.int32, 1](0))
-        ctx.enqueue_memset(cell_offsets_buffer, SIMD[DType.int32, 1](0))
+        ctx.enqueue_memset(histogram_buffer, 0)
 
         with agents_buffer.map_to_host() as agents_host:
-            var agents_tensor_host = LayoutTensor[dtype, agents_layout](agents_host)
+            var agents_tensor_host = LayoutTensor[dtype, agents_layout](agents_host.unsafe_ptr())
             for i in range(N):
                 agents_tensor_host[i, 0] = Float32(random_float64(0.0, Float64(WORLD_WIDTH)))
                 agents_tensor_host[i, 1] = Float32(random_float64(0.0, Float64(WORLD_HEIGHT)))
@@ -147,24 +151,20 @@ def main():
         )
 
         print("Launching parallel prefix sum kernel...")
-        var prefix_sum_threads = 1
-        while prefix_sum_threads < NUM_CELLS:
-            prefix_sum_threads *= 2
-        
         ctx.enqueue_function[
             parallel_prefix_sum_kernel[histogram_layout, cell_offsets_layout]
         ](
             histogram_tensor,
             cell_offsets_tensor,
             grid_dim=1,
-            block_dim=prefix_sum_threads,
+            block_dim=PADDED_NUM_CELLS,
         )
 
         ctx.synchronize()
         print("Kernel execution finished.")
 
         with cell_offsets_buffer.map_to_host() as result_offsets:
-            var offsets_tensor = LayoutTensor[DType.int32, cell_offsets_layout](result_offsets)
+            var offsets_tensor = LayoutTensor[DType.int32, cell_offsets_layout](result_offsets.unsafe_ptr())
             print("Cell offsets (first 20):")
             for i in range(20):
                 print("  Cell", i, "starts at index:", offsets_tensor[i][0])

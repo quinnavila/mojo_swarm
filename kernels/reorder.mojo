@@ -16,6 +16,7 @@ alias CELL_SIZE: Float32 = 50.0
 alias GRID_COLS = Int(floor(WORLD_WIDTH / CELL_SIZE))
 alias GRID_ROWS = Int(floor(WORLD_HEIGHT / CELL_SIZE))
 alias NUM_CELLS = GRID_COLS * GRID_ROWS
+alias PADDED_NUM_CELLS = 256
 
 alias dtype = DType.float32
 alias agents_layout = Layout.row_major(N, 4)
@@ -43,8 +44,8 @@ fn spatial_hash_kernel[
     var cell_y = Int(floor(py / CELL_SIZE))
     var hash = cell_y * GRID_COLS + cell_x
     
-    particle_hashes.store[1](i, 0, SIMD[DType.int32, 1](hash))
-    particle_indices.store[1](i, 0, SIMD[DType.int32, 1](i))
+    particle_hashes[i] = hash
+    particle_indices[i] = i
 
 fn histogram_kernel[
     hash_layout: Layout,
@@ -67,35 +68,39 @@ fn parallel_prefix_sum_kernel[
     cell_counts: LayoutTensor[mut=False, DType.int32, histogram_layout],
     cell_offsets: LayoutTensor[mut=True, DType.int32, cell_offsets_layout],
 ):
-    var shared_data = tb[DType.int32]().row_major[NUM_CELLS]().shared().alloc()
+    var shared_data = tb[DType.int32]().row_major[PADDED_NUM_CELLS]().shared().alloc()
     var i = thread_idx.x
 
     if i < NUM_CELLS:
-        shared_data[i] = cell_counts[i][0]
+        shared_data[i] = cell_counts[i]
+    elif i < PADDED_NUM_CELLS:
+        shared_data[i] = 0
     barrier()
 
-    var log2_num_cells = Int(log2(Float64(NUM_CELLS)))
-
-    for d in range(log2_num_cells):
+    var log2_padded = Int(log2(Float64(PADDED_NUM_CELLS)))
+    
+    for d in range(log2_padded):
+        var offset = 1 << d
         var stride = 1 << (d + 1)
         if (i + 1) % stride == 0:
-            shared_data[i] += shared_data[i - (stride // 2)]
+            shared_data[i] += shared_data[i - offset]
         barrier()
 
-    if i == NUM_CELLS - 1:
-        shared_data[NUM_CELLS - 1] = 0
+    if i == PADDED_NUM_CELLS - 1:
+        shared_data[i] = 0
     barrier()
 
-    for d in range(log2_num_cells - 1, -1, -1):
+    for d in range(log2_padded - 1, -1, -1):
+        var offset = 1 << d
         var stride = 1 << (d + 1)
         if (i + 1) % stride == 0:
-            var temp = shared_data[i - (stride // 2)]
-            shared_data[i - (stride // 2)] = shared_data[i]
+            var temp = shared_data[i - offset]
+            shared_data[i - offset] = shared_data[i]
             shared_data[i] += temp
         barrier()
 
     if i < NUM_CELLS:
-        cell_offsets.store[1](i, 0, SIMD[DType.int32, 1](shared_data[i][0]))
+        cell_offsets[i] = shared_data[i]
 
 fn reorder_kernel[
     agents_layout: Layout,
@@ -114,14 +119,14 @@ fn reorder_kernel[
         return
 
     var original_idx = Int(particle_indices[i][0])
-    var hash = particle_hashes[i][0]
+    var hash = Int(particle_hashes[i][0])
     
     var sorted_idx = Int(Atomic[DType.int32].fetch_add(cell_offsets_counter.ptr + hash, 1))
 
-    sorted_agents.store[1](sorted_idx, 0, original_agents[original_idx, 0][0])
-    sorted_agents.store[1](sorted_idx, 1, original_agents[original_idx, 1][0])
-    sorted_agents.store[1](sorted_idx, 2, original_agents[original_idx, 2][0])
-    sorted_agents.store[1](sorted_idx, 3, original_agents[original_idx, 3][0])
+    sorted_agents[sorted_idx, 0] = original_agents[original_idx, 0]
+    sorted_agents[sorted_idx, 1] = original_agents[original_idx, 1]
+    sorted_agents[sorted_idx, 2] = original_agents[original_idx, 2]
+    sorted_agents[sorted_idx, 3] = original_agents[original_idx, 3]
 
 def main():
     with DeviceContext() as ctx:
@@ -134,10 +139,10 @@ def main():
         cell_offsets_buffer = ctx.enqueue_create_buffer[DType.int32](cell_offsets_layout.size())
         cell_offsets_counter_buffer = ctx.enqueue_create_buffer[DType.int32](cell_offsets_layout.size())
         
-        ctx.enqueue_memset(histogram_buffer, SIMD[DType.int32, 1](0))
+        ctx.enqueue_memset(histogram_buffer, 0)
 
         with agents_buffer.map_to_host() as agents_host:
-            var agents_tensor_host = LayoutTensor[dtype, agents_layout](agents_host)
+            var agents_tensor_host = LayoutTensor[dtype, agents_layout](agents_host.unsafe_ptr())
             for i in range(N):
                 agents_tensor_host[i, 0] = Float32(random_float64(0.0, Float64(WORLD_WIDTH)))
                 agents_tensor_host[i, 1] = Float32(random_float64(0.0, Float64(WORLD_HEIGHT)))
@@ -163,15 +168,11 @@ def main():
         ctx.enqueue_function[
             histogram_kernel[hash_layout, histogram_layout]
         ](hashes_tensor, histogram_tensor, grid_dim=blocks_per_grid, block_dim=TPB)
-
-        print("Launching parallel prefix sum kernel...")
-        var prefix_sum_threads = 1
-        while prefix_sum_threads < NUM_CELLS:
-            prefix_sum_threads *= 2
         
+        print("Launching parallel prefix sum kernel...")
         ctx.enqueue_function[
             parallel_prefix_sum_kernel[histogram_layout, cell_offsets_layout]
-        ](histogram_tensor, cell_offsets_tensor, grid_dim=1, block_dim=prefix_sum_threads)
+        ](histogram_tensor, cell_offsets_tensor, grid_dim=1, block_dim=PADDED_NUM_CELLS)
 
         ctx.enqueue_copy(cell_offsets_counter_buffer, cell_offsets_buffer)
 
@@ -191,19 +192,18 @@ def main():
         ctx.synchronize()
         print("Kernel execution finished.")
 
-        with sorted_agents_buffer.map_to_host() as result_sorted, \
-             hashes_buffer.map_to_host() as result_hashes, \
-             indices_buffer.map_to_host() as result_indices:
-            var sorted_tensor = LayoutTensor[dtype, agents_layout](result_sorted)
-            var hashes_tensor_host = LayoutTensor[DType.int32, hash_layout](result_hashes)
-            var indices_tensor_host = LayoutTensor[DType.int32, index_layout](result_indices)
+        with sorted_agents_buffer.map_to_host() as result_sorted:
+            var sorted_tensor = LayoutTensor[dtype, agents_layout](result_sorted.unsafe_ptr())
             
-            print("First 10 reordered boids and their original index/hash:")
+            print("\nFirst 10 reordered boids and their calculated spatial hash:")
             for i in range(10):
-                var original_idx = indices_tensor_host[i][0]
-                var original_hash = hashes_tensor_host[i][0]
+                var px = sorted_tensor[i, 0][0]
+                var py = sorted_tensor[i, 1][0]
+                var cell_x = Int(floor(px / CELL_SIZE))
+                var cell_y = Int(floor(py / CELL_SIZE))
+                var hash = cell_y * GRID_COLS + cell_x
                 print(
                     "  Boid at sorted index", i, 
-                    ": pos=(", sorted_tensor[i, 0], ",", sorted_tensor[i, 1], ")",
-                    "Original Index:", original_idx, "Original Hash:", original_hash
+                    ": pos=(", px, ",", py, ")",
+                    "-> Hash:", hash
                 )

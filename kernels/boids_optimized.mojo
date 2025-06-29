@@ -1,3 +1,4 @@
+from time import perf_counter_ns
 from gpu.host import DeviceContext
 from gpu.id import block_dim, block_idx, thread_idx
 from gpu import barrier
@@ -7,7 +8,8 @@ from math import ceildiv, floor, log2
 from random import random_float64
 from os.atomic import Atomic
 
-alias N = 4096
+alias N = 100000
+alias STEPS = 200
 alias TPB = 256
 alias WORLD_WIDTH: Float32 = 800.0
 alias WORLD_HEIGHT: Float32 = 600.0
@@ -18,6 +20,7 @@ alias ALPHA: Float32 = 0.1
 alias GRID_COLS = Int(floor(WORLD_WIDTH / CELL_SIZE))
 alias GRID_ROWS = Int(floor(WORLD_HEIGHT / CELL_SIZE))
 alias NUM_CELLS = GRID_COLS * GRID_ROWS
+alias PADDED_NUM_CELLS = 256
 
 alias dtype = DType.float32
 alias agents_layout = Layout.row_major(N, 4)
@@ -45,8 +48,8 @@ fn spatial_hash_kernel[
     var cell_y = Int(floor(py / CELL_SIZE))
     var hash = cell_y * GRID_COLS + cell_x
     
-    particle_hashes.store[1](i, 0, SIMD[DType.int32, 1](hash))
-    particle_indices.store[1](i, 0, SIMD[DType.int32, 1](i))
+    particle_hashes[i] = hash
+    particle_indices[i] = i
 
 fn histogram_kernel[
     hash_layout: Layout,
@@ -69,35 +72,39 @@ fn parallel_prefix_sum_kernel[
     cell_counts: LayoutTensor[mut=False, DType.int32, histogram_layout],
     cell_offsets: LayoutTensor[mut=True, DType.int32, cell_offsets_layout],
 ):
-    var shared_data = tb[DType.int32]().row_major[NUM_CELLS]().shared().alloc()
+    var shared_data = tb[DType.int32]().row_major[PADDED_NUM_CELLS]().shared().alloc()
     var i = thread_idx.x
 
     if i < NUM_CELLS:
-        shared_data[i] = cell_counts[i][0]
+        shared_data[i] = cell_counts[i]
+    elif i < PADDED_NUM_CELLS:
+        shared_data[i] = 0
     barrier()
 
-    var log2_num_cells = Int(log2(Float64(NUM_CELLS)))
-
-    for d in range(log2_num_cells):
+    var log2_padded = Int(log2(Float64(PADDED_NUM_CELLS)))
+    
+    for d in range(log2_padded):
+        var offset = 1 << d
         var stride = 1 << (d + 1)
         if (i + 1) % stride == 0:
-            shared_data[i] += shared_data[i - (stride // 2)]
+            shared_data[i] += shared_data[i - offset]
         barrier()
 
-    if i == NUM_CELLS - 1:
-        shared_data[NUM_CELLS - 1] = 0
+    if i == PADDED_NUM_CELLS - 1:
+        shared_data[i] = 0
     barrier()
 
-    for d in range(log2_num_cells - 1, -1, -1):
+    for d in range(log2_padded - 1, -1, -1):
+        var offset = 1 << d
         var stride = 1 << (d + 1)
         if (i + 1) % stride == 0:
-            var temp = shared_data[i - (stride // 2)]
-            shared_data[i - (stride // 2)] = shared_data[i]
+            var temp = shared_data[i - offset]
+            shared_data[i - offset] = shared_data[i]
             shared_data[i] += temp
         barrier()
 
     if i < NUM_CELLS:
-        cell_offsets.store[1](i, 0, SIMD[DType.int32, 1](shared_data[i][0]))
+        cell_offsets[i] = shared_data[i]
 
 fn reorder_kernel[
     agents_layout: Layout,
@@ -116,14 +123,14 @@ fn reorder_kernel[
         return
 
     var original_idx = Int(particle_indices[i][0])
-    var hash = particle_hashes[i][0]
+    var hash = Int(particle_hashes[i][0])
     
     var sorted_idx = Int(Atomic[DType.int32].fetch_add(cell_offsets_counter.ptr + hash, 1))
 
-    sorted_agents.store[1](sorted_idx, 0, original_agents[original_idx, 0][0])
-    sorted_agents.store[1](sorted_idx, 1, original_agents[original_idx, 1][0])
-    sorted_agents.store[1](sorted_idx, 2, original_agents[original_idx, 2][0])
-    sorted_agents.store[1](sorted_idx, 3, original_agents[original_idx, 3][0])
+    sorted_agents[sorted_idx, 0] = original_agents[original_idx, 0]
+    sorted_agents[sorted_idx, 1] = original_agents[original_idx, 1]
+    sorted_agents[sorted_idx, 2] = original_agents[original_idx, 2]
+    sorted_agents[sorted_idx, 3] = original_agents[original_idx, 3]
 
 fn boids_update_optimized_kernel[
     agents_layout: Layout,
@@ -189,102 +196,120 @@ fn boids_update_optimized_kernel[
         vx_next = vx
         vy_next = vy
 
-    var px_next = px + vx_next
-    var py_next = py + vy_next
+    var px_next = (px + vx_next + WORLD_WIDTH) % WORLD_WIDTH
+    var py_next = (py + vy_next + WORLD_HEIGHT) % WORLD_HEIGHT
 
-    agents_next.store[1](i, 0, px_next)
-    agents_next.store[1](i, 1, py_next)
-    agents_next.store[1](i, 2, vx_next)
-    agents_next.store[1](i, 3, vy_next)
+    agents_next[i, 0] = px_next
+    agents_next[i, 1] = py_next
+    agents_next[i, 2] = vx_next
+    agents_next[i, 3] = vy_next
 
 def main():
     with DeviceContext() as ctx:
-        print("Initializing GPU buffers...")
-        agents_buffer = ctx.enqueue_create_buffer[dtype](agents_layout.size())
-        sorted_agents_buffer = ctx.enqueue_create_buffer[dtype](agents_layout.size())
-        agents_next_buffer = ctx.enqueue_create_buffer[dtype](agents_layout.size())
-        hashes_buffer = ctx.enqueue_create_buffer[DType.int32](hash_layout.size())
-        indices_buffer = ctx.enqueue_create_buffer[DType.int32](index_layout.size())
-        histogram_buffer = ctx.enqueue_create_buffer[DType.int32](histogram_layout.size())
-        cell_offsets_buffer = ctx.enqueue_create_buffer[DType.int32](cell_offsets_layout.size())
-        cell_offsets_counter_buffer = ctx.enqueue_create_buffer[DType.int32](cell_offsets_layout.size())
+        print("Initializing", N, "boids...")
         
-        ctx.enqueue_memset(histogram_buffer, SIMD[DType.int32, 1](0))
+        var agents_buf_A = ctx.enqueue_create_buffer[dtype](agents_layout.size())
+        var agents_buf_B = ctx.enqueue_create_buffer[dtype](agents_layout.size())
+        var sorted_agents_buffer = ctx.enqueue_create_buffer[dtype](agents_layout.size())
+        var hashes_buffer = ctx.enqueue_create_buffer[DType.int32](hash_layout.size())
+        var indices_buffer = ctx.enqueue_create_buffer[DType.int32](index_layout.size())
+        var histogram_buffer = ctx.enqueue_create_buffer[DType.int32](histogram_layout.size())
+        var cell_offsets_buffer = ctx.enqueue_create_buffer[DType.int32](cell_offsets_layout.size())
+        var cell_offsets_counter_buffer = ctx.enqueue_create_buffer[DType.int32](cell_offsets_layout.size())
 
-        with agents_buffer.map_to_host() as agents_host:
-            var agents_tensor_host = LayoutTensor[dtype, agents_layout](agents_host)
+        with agents_buf_A.map_to_host() as agents_host:
+            var agents_tensor_host = LayoutTensor[dtype, agents_layout](agents_host.unsafe_ptr())
             for i in range(N):
                 agents_tensor_host[i, 0] = Float32(random_float64(0.0, Float64(WORLD_WIDTH)))
                 agents_tensor_host[i, 1] = Float32(random_float64(0.0, Float64(WORLD_HEIGHT)))
                 agents_tensor_host[i, 2] = Float32(random_float64(-2.0, 2.0))
                 agents_tensor_host[i, 3] = Float32(random_float64(-2.0, 2.0))
 
-        var agents_tensor = LayoutTensor[dtype, agents_layout](agents_buffer)
-        var sorted_agents_tensor = LayoutTensor[dtype, agents_layout](sorted_agents_buffer)
-        var agents_next_tensor = LayoutTensor[dtype, agents_layout](agents_next_buffer)
+        var current_agents_buffer = agents_buf_A
+        var next_agents_buffer = agents_buf_B
+
         var hashes_tensor = LayoutTensor[DType.int32, hash_layout](hashes_buffer)
         var indices_tensor = LayoutTensor[DType.int32, index_layout](indices_buffer)
         var histogram_tensor = LayoutTensor[DType.int32, histogram_layout](histogram_buffer)
         var cell_offsets_tensor = LayoutTensor[DType.int32, cell_offsets_layout](cell_offsets_buffer)
         var cell_offsets_counter_tensor = LayoutTensor[DType.int32, cell_offsets_layout](cell_offsets_counter_buffer)
+        var sorted_agents_tensor = LayoutTensor[dtype, agents_layout](sorted_agents_buffer)
 
         var blocks_per_grid = ceildiv(N, TPB)
-
-        print("Launching spatial hash kernel...")
-        ctx.enqueue_function[
-            spatial_hash_kernel[agents_layout, hash_layout, index_layout]
-        ](hashes_tensor, indices_tensor, agents_tensor, grid_dim=blocks_per_grid, block_dim=TPB)
-
-        print("Launching histogram kernel...")
-        ctx.enqueue_function[
-            histogram_kernel[hash_layout, histogram_layout]
-        ](hashes_tensor, histogram_tensor, grid_dim=blocks_per_grid, block_dim=TPB)
-
-        print("Launching parallel prefix sum kernel...")
-        var prefix_sum_threads = 1
-        while prefix_sum_threads < NUM_CELLS:
-            prefix_sum_threads *= 2
         
-        ctx.enqueue_function[
-            parallel_prefix_sum_kernel[histogram_layout, cell_offsets_layout]
-        ](histogram_tensor, cell_offsets_tensor, grid_dim=1, block_dim=prefix_sum_threads)
+        print("Starting simulation for", STEPS, "steps...")
+        var total_kernel_time_ns: Int = 0
+        
+        var sim_start_ns = perf_counter_ns()
 
-        ctx.enqueue_copy(cell_offsets_counter_buffer, cell_offsets_buffer)
+        for _ in range(STEPS):
+            var step_start_ns = perf_counter_ns()
 
-        print("Launching reorder kernel...")
-        ctx.enqueue_function[
-            reorder_kernel[agents_layout, hash_layout, index_layout, cell_offsets_layout]
-        ](
-            sorted_agents_tensor,
-            agents_tensor,
-            hashes_tensor,
-            indices_tensor,
-            cell_offsets_counter_tensor,
-            grid_dim=blocks_per_grid,
-            block_dim=TPB,
-        )
+            var current_agents_tensor = LayoutTensor[dtype, agents_layout](current_agents_buffer)
+            var next_agents_tensor = LayoutTensor[dtype, agents_layout](next_agents_buffer)
 
-        print("Launching optimized boids update kernel...")
-        ctx.enqueue_function[
-            boids_update_optimized_kernel[agents_layout, histogram_layout, cell_offsets_layout]
-        ](
-            agents_next_tensor,
-            sorted_agents_tensor,
-            histogram_tensor,
-            cell_offsets_tensor,
-            grid_dim=blocks_per_grid,
-            block_dim=TPB,
-        )
+            ctx.enqueue_memset(histogram_buffer, 0)
 
-        ctx.synchronize()
-        print("Kernel execution finished.")
+            ctx.enqueue_function[
+                spatial_hash_kernel[agents_layout, hash_layout, index_layout]
+            ](hashes_tensor, indices_tensor, current_agents_tensor, grid_dim=blocks_per_grid, block_dim=TPB)
 
-        with agents_next_buffer.map_to_host() as result_next:
-            var next_tensor = LayoutTensor[dtype, agents_layout](result_next)
-            print("First 10 boids after one optimized step:")
-            for i in range(10):
+            ctx.enqueue_function[
+                histogram_kernel[hash_layout, histogram_layout]
+            ](hashes_tensor, histogram_tensor, grid_dim=blocks_per_grid, block_dim=TPB)
+            
+            ctx.enqueue_function[
+                parallel_prefix_sum_kernel[histogram_layout, cell_offsets_layout]
+            ](histogram_tensor, cell_offsets_tensor, grid_dim=1, block_dim=PADDED_NUM_CELLS)
+
+            ctx.enqueue_copy(cell_offsets_counter_buffer, cell_offsets_buffer)
+
+            ctx.enqueue_function[
+                reorder_kernel[agents_layout, hash_layout, index_layout, cell_offsets_layout]
+            ](
+                sorted_agents_tensor,
+                current_agents_tensor,
+                hashes_tensor,
+                indices_tensor,
+                cell_offsets_counter_tensor,
+                grid_dim=blocks_per_grid,
+                block_dim=TPB,
+            )
+
+            ctx.enqueue_function[
+                boids_update_optimized_kernel[agents_layout, histogram_layout, cell_offsets_layout]
+            ](
+                next_agents_tensor,
+                sorted_agents_tensor,
+                histogram_tensor,
+                cell_offsets_tensor,
+                grid_dim=blocks_per_grid,
+                block_dim=TPB,
+            )
+
+            ctx.synchronize()
+            
+            var step_end_ns = perf_counter_ns()
+            total_kernel_time_ns += (step_end_ns - step_start_ns)
+
+            var temp_buf = current_agents_buffer
+            current_agents_buffer = next_agents_buffer
+            next_agents_buffer = temp_buf
+
+        var sim_end_ns = perf_counter_ns()
+        var total_duration_s = (sim_end_ns - sim_start_ns) / 1_000_000_000
+        var avg_kernel_ms = (total_kernel_time_ns / STEPS) / 1_000_000
+
+        print("\nSimulation finished.")
+        print("Total steps:", STEPS)
+        print("Total simulation time:", total_duration_s, "seconds")
+        print("Average time per kernel step:", avg_kernel_ms, "ms")
+
+        print("\nFinal state of first 3 boids:")
+        with current_agents_buffer.map_to_host() as result_host:
+            var result_tensor = LayoutTensor[dtype, agents_layout](result_host.unsafe_ptr())
+            for i in range(3):
                 print(
-                    "  Boid at index", i, 
-                    ": pos=(", next_tensor[i, 0], ",", next_tensor[i, 1], ")",
-                    "vel=(", next_tensor[i, 2], ",", next_tensor[i, 3], ")"
+                    "  Boid", i, ": pos=(", result_tensor[i, 0][0], ",", result_tensor[i, 1][0], 
+                    ") vel=(", result_tensor[i, 2][0], ",", result_tensor[i, 3][0], ")"
                 )
