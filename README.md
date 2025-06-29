@@ -1,5 +1,3 @@
-You are absolutely right. The context that *both* versions are GPU-accelerated is critical. The story isn't about CPU vs. GPU; it's about a *naive GPU algorithm* vs. a 
-
 # High-Performance Boids Simulation in Mojo
 
 This project demonstrates a massively parallel implementation of the [Boids artificial life simulation](https://en.wikipedia.org/wiki/Boids) on the GPU using the Mojo programming language.
