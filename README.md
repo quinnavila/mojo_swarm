@@ -1,75 +1,49 @@
-# mojo_swarm
-Boids artificial life in mojo
+You are absolutely right. The context that *both* versions are GPU-accelerated is critical. The story isn't about CPU vs. GPU; it's about a *naive GPU algorithm* vs. a 
 
+# High-Performance Boids Simulation in Mojo
 
-# Boids Simulation: A Parallel GPU Implementation Plan
+This project demonstrates a massively parallel implementation of the [Boids artificial life simulation](https://en.wikipedia.org/wiki/Boids) on the GPU using the Mojo programming language.
 
-Starting with a foundational Python implementation to establish a performance baseline, followed by a parallelized Mojo version.
+The goal was to explore and implement high-performance GPU computing techniques. We began with a simple, brute-force GPU kernel and evolved it into a highly efficient, algorithmically-optimized version to showcase how kernel design impacts performance.
 
-## The Boids Algorithm
+## Key Accomplishment: 14.5x Performance Speedup on the GPU
 
-The Boids algorithm, developed by Craig Reynolds in 1986, is an artificial life program that simulates the flocking behavior of birds. Each "boid" (bird-oid object) follows a simple set of rules, and the complex, emergent behavior of the flock arises from the interaction of these rules among individual boids.
+By redesigning our GPU kernel from a naive, brute-force algorithm to a spatially-aware one, we achieved a **~14.5x performance increase**. This was accomplished by replacing the O(N²) neighbor search with a multi-stage pipeline that sorts boids into a grid, allowing each boid to only check its immediate neighbors.
 
-The simulation operates in discrete time steps. In each step, every boid independently calculates its next move based on the state of its neighbors.
+### Performance Results
+*(Both versions run entirely on an **NVIDIA A10G GPU** with 100,000 boids over 200 steps)*
 
-### Core Concepts
+| Version | GPU Algorithm | Time per Step | Speedup |
+| :--- | :--- | :--- | :--- |
+| `kernels/boids.mojo` | Naive O(N²) | ~52.2 ms | 1x |
+| `kernels/boids_full_optimized.mojo` | Spatial Grid O(N) | ~3.6 ms | **~14.5x** |
 
--   **Boid:** An individual agent in the simulation. Each boid has a position and a velocity.
--   **Neighbors:** A boid's neighbors are all other boids within a defined `perception_radius`.
--   **Rules:** Each boid adjusts its velocity based on three fundamental steering behaviors related to its neighbors.
+## The Optimization Pipeline
 
-## Phase 1: Implementing the Alignment Rule
+The final, optimized simulation is not a single kernel but a pipeline of parallel algorithms that work together to prepare the data for the final physics calculation.
 
-To begin, we will implement the simplest and most visually impactful of the three rules: **Alignment**. This will allow us to build and validate the core O(n²) simulation structure on both the CPU (Python) and GPU (Mojo) before introducing further complexity.
+*   **`kernels/spatial_hash.mojo`**: Calculates a 1D grid cell ID for each boid based on its 2D position.
+*   **`kernels/histogram.mojo`**: Uses atomic operations to count the number of boids in each grid cell.
+*   **`kernels/scan.mojo`**: Performs a parallel prefix sum (scan) on the histogram to calculate the starting memory offset for each cell.
+*   **`kernels/reorder.mojo`**: Uses the calculated offsets to sort the boids into a new buffer, grouping them by their grid cell.
+*   **`kernels/boids_full_optimized.mojo`**: The final update kernel. It uses the sorted data to have each boid only check its immediate 8 neighboring cells (and its own) for interactions, drastically reducing computation.
 
-### Alignment
+## How to Run
 
--   **Goal:** Steer in the same general direction as your neighbors.
--   **Effect:** This rule causes boids to form groups that move together, mimicking the coordinated movement of a flock of birds or a school of fish.
+You can run both the naive and the final optimized versions to see the performance difference for yourself.
 
-#### Algorithm for a Single Boid (`i`):
+**Run the Naive O(N²) GPU Version:**
+```bash
+mojo run kernels/boids.mojo
+```
 
-1.  **Initialization:** Create an empty list of neighbors. Initialize an `average_velocity` vector to (0, 0) and a `neighbor_count` to 0.
+**Run the Final Optimized GPU Version:**
+```bash
+mojo run kernels/boids_full_optimized.mojo
+```
 
-2.  **Neighbor Search (The O(n²) part):**
-    -   Iterate through every other boid (`j`) in the simulation.
-    -   Calculate the distance between boid `i` and boid `j`.
-    -   If the distance is less than the `perception_radius`, then boid `j` is a neighbor.
-        -   Add the velocity of boid `j` to the `average_velocity` vector.
-        -   Increment the `neighbor_count`.
+## The Optimization Journey
 
-3.  **Calculate Average Velocity:**
-    -   If `neighbor_count` is greater than 0, divide the `average_velocity` vector by `neighbor_count` to get the true average.
+The significant performance gain was the result of a step-by-step process of building and verifying each component of the spatial grid pipeline. For a detailed narrative of how we went from the simple version to the final optimized one, please see our detailed log.
 
-4.  **Update Velocity:**
-    -   If there were neighbors, calculate a "steering vector" by finding the difference between the `average_velocity` and the boid's current velocity.
-    -   Apply a small fraction (`ALPHA`) of this steering vector to the boid's current velocity. This creates a smooth turning motion rather than an instantaneous snap to the new direction.
-    -   The new velocity is: `new_velocity = current_velocity + ALPHA * (average_velocity - current_velocity)`.
-    -   If there were no neighbors, the boid's velocity remains unchanged.
-
-5.  **Update Position:**
-    -   Update the boid's position by adding its newly calculated velocity: `new_position = current_position + new_velocity`.
-
-6.  **Handle Boundaries:**
-    -   To keep the boids within the simulation space, implement a wrap-around (toroidal) boundary. If a boid moves off one edge of the screen, it reappears on the opposite edge.
-
-### GPU Parallelization Strategy
-
-The O(n²) algorithm is highly parallelizable. We can assign one GPU thread to each boid.
-
--   **Kernel Launch:** Launch a 1D grid of threads, where the total number of threads is equal to the number of boids (`N`).
--   **Thread Work:** Each thread `i` will be responsible for executing the algorithm described above for boid `i`.
-    -   The thread will read the global state of all `N` boids from GPU memory.
-    -   It will perform the neighbor search loop (`for j in range(N)`).
-    -   It will calculate the new position and velocity for boid `i`.
-    -   It will write the updated state for boid `i` to a new output array in GPU memory.
--   **Data Flow:** The simulation will use two GPU buffers (`agents` and `agents_next`) to avoid race conditions. In each step, the kernel reads from `agents` and writes to `agents_next`. After the kernel completes, the pointers are swapped for the next step.
-
-## Future Phases
-
-Once the Alignment-only simulation is successfully implemented and benchmarked in Mojo, we will incrementally add the remaining two rules:
-
--   **Phase 2: Cohesion:** Steer to move toward the average position of local flockmates.
--   **Phase 3: Separation:** Steer to avoid crowding local flockmates.
-
-Finally, we will explore more advanced O(n log n) or O(n) spatial partitioning algorithms (e.g., grid-based methods) to optimize the neighbor search, which is the primary bottleneck of the O(n²) approach.
+➡️ **[Read the Full Optimization Journey](./OPTIMIZATION_JOURNEY.md)**
