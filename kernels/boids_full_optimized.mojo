@@ -25,7 +25,6 @@ alias MIN_SPEED: Float32 = 1.0
 alias GRID_COLS = Int(floor(WORLD_WIDTH / CELL_SIZE))
 alias GRID_ROWS = Int(floor(WORLD_HEIGHT / CELL_SIZE))
 alias NUM_CELLS = GRID_COLS * GRID_ROWS
-alias PADDED_NUM_CELLS = 256
 
 alias dtype = DType.float32
 alias agents_layout = Layout.row_major(N, 4)
@@ -76,46 +75,18 @@ fn histogram_kernel[
     var hash = particle_hashes[i][0]
     _ = Atomic[DType.int32].fetch_add(cell_counts.ptr + hash, 1)
 
-fn parallel_prefix_sum_kernel[
+fn sequential_prefix_sum_kernel[
     histogram_layout: Layout,
     cell_offsets_layout: Layout,
 ](
     cell_counts: LayoutTensor[mut=False, DType.int32, histogram_layout],
     cell_offsets: LayoutTensor[mut=True, DType.int32, cell_offsets_layout],
 ):
-    var shared_data = tb[DType.int32]().row_major[PADDED_NUM_CELLS]().shared().alloc()
-    var i = thread_idx.x
-
-    if i < NUM_CELLS:
-        shared_data[i] = cell_counts[i]
-    elif i < PADDED_NUM_CELLS:
-        shared_data[i] = 0
-    barrier()
-
-    var log2_padded = Int(log2(Float64(PADDED_NUM_CELLS)))
-    
-    for d in range(log2_padded):
-        var offset = 1 << d
-        var stride = 1 << (d + 1)
-        if (i + 1) % stride == 0:
-            shared_data[i] += shared_data[i - offset]
-        barrier()
-
-    if i == PADDED_NUM_CELLS - 1:
-        shared_data[i] = 0
-    barrier()
-
-    for d in range(log2_padded - 1, -1, -1):
-        var offset = 1 << d
-        var stride = 1 << (d + 1)
-        if (i + 1) % stride == 0:
-            var temp = shared_data[i - offset]
-            shared_data[i - offset] = shared_data[i]
-            shared_data[i] += temp
-        barrier()
-
-    if i < NUM_CELLS:
-        cell_offsets[i] = shared_data[i]
+    if thread_idx.x == 0 and block_idx.x == 0:
+        var running_sum: Int32 = 0
+        for i in range(NUM_CELLS):
+            cell_offsets[i] = running_sum
+            running_sum += cell_counts[i][0]
 
 fn reorder_kernel[
     agents_layout: Layout,
@@ -195,14 +166,14 @@ fn boids_update_optimized_kernel[
                     var d_py = py - neighbor_py
                     var dist_sq = d_px * d_px + d_py * d_py
 
-                    if dist_sq < R * R:
+                    if dist_sq < R * R and dist_sq > 1e-6:
                         neighbor_count += 1
                         avg_px += neighbor_px
                         avg_py += neighbor_py
                         avg_vx += sorted_agents[j, 2][0]
                         avg_vy += sorted_agents[j, 3][0]
-                        sep_vx += d_px / (dist_sq + 1e-6)
-                        sep_vy += d_py / (dist_sq + 1e-6)
+                        sep_vx += d_px / dist_sq
+                        sep_vy += d_py / dist_sq
 
     var vx_next = vx
     var vy_next = vy
@@ -296,8 +267,8 @@ def main():
             ](hashes_tensor, histogram_tensor, grid_dim=blocks_per_grid, block_dim=TPB)
             
             ctx.enqueue_function[
-                parallel_prefix_sum_kernel[histogram_layout, cell_offsets_layout]
-            ](histogram_tensor, cell_offsets_tensor, grid_dim=1, block_dim=PADDED_NUM_CELLS)
+                sequential_prefix_sum_kernel[histogram_layout, cell_offsets_layout]
+            ](histogram_tensor, cell_offsets_tensor, grid_dim=1, block_dim=1)
 
             ctx.enqueue_copy(cell_offsets_counter_buffer, cell_offsets_buffer)
 

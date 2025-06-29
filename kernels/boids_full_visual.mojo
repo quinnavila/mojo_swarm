@@ -8,12 +8,12 @@ from math import ceildiv, floor, log2, sqrt
 from random import random_float64
 from os.atomic import Atomic
 
-alias N = 200
+alias N = 500
 alias STEPS = 500
 alias TPB = 256
 alias WORLD_WIDTH: Float32 = 800.0
 alias WORLD_HEIGHT: Float32 = 600.0
-alias R: Float32 = 10.0
+alias R: Float32 = 20.0
 alias CELL_SIZE: Float32 = R
 
 alias SEPARATION_STRENGTH: Float32 = 0.05
@@ -30,7 +30,6 @@ alias FRAME_DELAY_S = 0.05
 alias GRID_COLS = Int(floor(WORLD_WIDTH / CELL_SIZE))
 alias GRID_ROWS = Int(floor(WORLD_HEIGHT / CELL_SIZE))
 alias NUM_CELLS = GRID_COLS * GRID_ROWS
-alias PADDED_NUM_CELLS = 256
 
 alias dtype = DType.float32
 alias agents_layout = Layout.row_major(N, 4)
@@ -81,46 +80,18 @@ fn histogram_kernel[
     var hash = particle_hashes[i][0]
     _ = Atomic[DType.int32].fetch_add(cell_counts.ptr + hash, 1)
 
-fn parallel_prefix_sum_kernel[
+fn sequential_prefix_sum_kernel[
     histogram_layout: Layout,
     cell_offsets_layout: Layout,
 ](
     cell_counts: LayoutTensor[mut=False, DType.int32, histogram_layout],
     cell_offsets: LayoutTensor[mut=True, DType.int32, cell_offsets_layout],
 ):
-    var shared_data = tb[DType.int32]().row_major[PADDED_NUM_CELLS]().shared().alloc()
-    var i = thread_idx.x
-
-    if i < NUM_CELLS:
-        shared_data[i] = cell_counts[i]
-    elif i < PADDED_NUM_CELLS:
-        shared_data[i] = 0
-    barrier()
-
-    var log2_padded = Int(log2(Float64(PADDED_NUM_CELLS)))
-    
-    for d in range(log2_padded):
-        var offset = 1 << d
-        var stride = 1 << (d + 1)
-        if (i + 1) % stride == 0:
-            shared_data[i] += shared_data[i - offset]
-        barrier()
-
-    if i == PADDED_NUM_CELLS - 1:
-        shared_data[i] = 0
-    barrier()
-
-    for d in range(log2_padded - 1, -1, -1):
-        var offset = 1 << d
-        var stride = 1 << (d + 1)
-        if (i + 1) % stride == 0:
-            var temp = shared_data[i - offset]
-            shared_data[i - offset] = shared_data[i]
-            shared_data[i] += temp
-        barrier()
-
-    if i < NUM_CELLS:
-        cell_offsets[i] = shared_data[i]
+    if thread_idx.x == 0 and block_idx.x == 0:
+        var running_sum: Int32 = 0
+        for i in range(NUM_CELLS):
+            cell_offsets[i] = running_sum
+            running_sum += cell_counts[i][0]
 
 fn reorder_kernel[
     agents_layout: Layout,
@@ -250,13 +221,13 @@ fn draw_boids(
     agents_buffer: DeviceBuffer[dtype],
     ctx: DeviceContext,
 ) raises:
-    var screen = List[List[String]]()
+    var counts = List[List[Int]]()
     for _ in range(TERM_HEIGHT):
-        var row = List[String]()
+        var row = List[Int]()
         for _ in range(TERM_WIDTH):
-            row.append(" ")
-        screen.append(row)
-
+            row.append(0)
+        counts.append(row)
+    
     with agents_buffer.map_to_host() as agents_host:
         var agents_tensor = LayoutTensor[dtype, agents_layout](agents_host.unsafe_ptr())
         
@@ -267,11 +238,27 @@ fn draw_boids(
             var screen_x = Int(px / WORLD_WIDTH * TERM_WIDTH)
             var screen_y = Int(py / WORLD_HEIGHT * TERM_HEIGHT)
 
-            if (
-                screen_x >= 0 and screen_x < TERM_WIDTH
-                and screen_y >= 0 and screen_y < TERM_HEIGHT
-            ):
-                screen[screen_y][screen_x] = ">"
+            screen_x = max(0, min(screen_x, TERM_WIDTH-1))
+            screen_y = max(0, min(screen_y, TERM_HEIGHT-1))
+            
+            counts[screen_y][screen_x] += 1
+
+    var screen = List[List[String]]()
+    for y in range(TERM_HEIGHT):
+        var row = List[String]()
+        for x in range(TERM_WIDTH):
+            var count = counts[y][x]
+            if count == 0:
+                row.append(" ")
+            elif count == 1:
+                row.append("·")
+            elif count == 2:
+                row.append("o")
+            elif count == 3:
+                row.append("O")
+            else:
+                row.append("@")
+        screen.append(row)
 
     print("\033[H\033[J", end="")
     for r in range(TERM_HEIGHT):
@@ -334,8 +321,8 @@ def main():
             ](hashes_tensor, histogram_tensor, grid_dim=blocks_per_grid, block_dim=TPB)
             
             ctx.enqueue_function[
-                parallel_prefix_sum_kernel[histogram_layout, cell_offsets_layout]
-            ](histogram_tensor, cell_offsets_tensor, grid_dim=1, block_dim=PADDED_NUM_CELLS)
+                sequential_prefix_sum_kernel[histogram_layout, cell_offsets_layout]
+            ](histogram_tensor, cell_offsets_tensor, grid_dim=1, block_dim=1)
 
             ctx.enqueue_copy(cell_offsets_counter_buffer, cell_offsets_buffer)
 
@@ -361,22 +348,22 @@ def main():
                 grid_dim=blocks_per_grid,
                 block_dim=TPB,
             )
-
-            ctx.synchronize()
             
             var step_end_ns = perf_counter_ns()
             total_kernel_time_ns += (step_end_ns - step_start_ns)
 
             if step % VIS_INTERVAL == 0:
+                ctx.synchronize()
                 draw_boids(next_agents_buffer, ctx)
-                var step_duration_ms = (step_end_ns - step_start_ns) / 1_000_000
-                print("Step:", step, "| Kernel Time:", step_duration_ms, "ms")
+                var step_duration_ms = (perf_counter_ns() - step_start_ns) / 1_000_000
+                print("Step:", step, "| Frame Time:", step_duration_ms, "ms")
                 sleep(FRAME_DELAY_S)
 
             var temp_buf = current_agents_buffer
             current_agents_buffer = next_agents_buffer
             next_agents_buffer = temp_buf
 
+        ctx.synchronize()
         var sim_end_ns = perf_counter_ns()
         var total_duration_s = (sim_end_ns - sim_start_ns) / 1_000_000_000
         var avg_kernel_ms = (total_kernel_time_ns / STEPS) / 1_000_000
